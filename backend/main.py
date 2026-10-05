@@ -1582,20 +1582,21 @@ def _thumb_lines(title: str):
     return lines[:3]
 
 
-def _make_thumb(outp: str, title: str) -> str:
+def _make_thumb(outp: str, title: str, dur: float = 10.0) -> str:
     lines = _thumb_lines(title)
     draw = ""
-    y = 700
+    y = 300
     for ln in lines:
         draw += (f",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='{ln}':"
-                 f"fontsize=88:fontcolor=white:borderw=3:bordercolor=black:"
+                 f"fontsize=96:fontcolor=white:borderw=3:bordercolor=black:"
                  f"x=(w-text_w)/2:y={y}")
-        y += 130
+        y += 140
     draw += (",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='SHORTS':"
-             "fontsize=54:fontcolor=yellow:borderw=2:bordercolor=black:x=(w-text_w)/2:y=1150")
+             "fontsize=60:fontcolor=yellow:borderw=2:bordercolor=black:x=(w-text_w)/2:y=" + str(y + 30))
     thumb = outp[:-4] + "_thumb.jpg"
-    subprocess.run(["ffmpeg", "-y", "-ss", "1", "-i", outp, "-vframes", "1",
-                    "-vf", "scale=1080:1920,eq=brightness=-0.25" + draw,
+    at = max(0.5, dur * 0.35)
+    subprocess.run(["ffmpeg", "-y", "-ss", str(round(at, 1)), "-i", outp, "-vframes", "1",
+                    "-vf", "scale=1080:1920,eq=brightness=-0.4" + draw,
                     "-q:v", "3", thumb],
                    check=True, timeout=120,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1641,36 +1642,66 @@ def _run_render_job(job_id: str, req: RenderRequest):
         _render_jobs[job_id] = {"pct": 0, "stage": "error", "done": True, "error": msg[:300]}
 
     try:
-        sec = f"*{int(s)}-{int(e) + 1}"
         tmp = os.path.join(outdir, f"{vid}_src.%(ext)s")
         _render_jobs[job_id] = {"pct": 1, "stage": "download", "done": False}
         p = subprocess.Popen([sys.executable, "-m", "yt_dlp", "--newline", "--progress",
-                              "--download-sections", sec, "--force-keyframes-at-cuts",
                               "-f", "bv*[height<=720]+ba/b[height<=720]/b",
+                              "--merge-output-format", "mp4",
                               "-o", tmp, req.url],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True, bufsize=1)
         for line in p.stdout:
             m = re.search(r"\[download\]\s+(\d+(?:\.\d+)?)%", line)
             if m:
-                _render_jobs[job_id] = {"pct": round(min(99.0, float(m.group(1))) * 0.6, 1),
+                _render_jobs[job_id] = {"pct": round(min(99.0, float(m.group(1))) * 0.5, 1),
                                         "stage": "download", "done": False}
-        p.wait(timeout=600)
+        p.wait(timeout=900)
         if p.returncode != 0:
             return fail("download failed")
         cands = [f for f in os.listdir(outdir) if f.startswith(vid + "_src.")]
         if not cands:
             return fail("download produced no file")
         src = os.path.join(outdir, cands[0])
-        title = _safe_draw_text(req.title, 60)
+        tlines = _thumb_lines(req.title)
+        tdraw = ""
+        _ty = 80
+        for _ln in tlines:
+            tdraw += (f",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='{_ln}':fontsize=54:"
+                      f"fontcolor=white:borderw=2:bordercolor=black:x=(w-text_w)/2:y={_ty}")
+            _ty += 70
         cap = _safe_draw_text(req.caption, 90)
+        thumb = None
+        try:
+            lines = _thumb_lines(req.title)
+            tdraw = ""
+            _y = 300
+            for _ln in lines:
+                tdraw += (f",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='{_ln}':"
+                          f"fontsize=96:fontcolor=white:borderw=3:bordercolor=black:"
+                          f"x=(w-text_w)/2:y={_y}")
+                _y += 140
+            tdraw += (",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='SHORTS':"
+                      "fontsize=60:fontcolor=yellow:borderw=2:bordercolor=black:"
+                      f"x=(w-text_w)/2:y={_y + 30}")
+            thumb = fname[:-4] + "_thumb.jpg"
+            subprocess.run(["ffmpeg", "-y", "-ss", str(round(s + max(0.5, (e - s) * 0.35), 1)),
+                            "-i", src, "-vframes", "1",
+                            "-vf", ("[0:v]split[a][b];"
+                                     "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
+                                     "crop=1080:1920,gblur=sigma=40[bg];"
+                                     "[b]scale=1080:-2[fg];"
+                                     "[bg][fg]overlay=(W-w)/2:(H-h)/2" + tdraw),
+                            "-q:v", "3", os.path.join(outdir, thumb)],
+                           check=True, timeout=120,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as ex:
+            logger.warning(f"thumb failed: {ex}")
+            thumb = None
         vf = ("[0:v]split[a][b];"
               "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=40[bg];"
               "[b]scale=1080:-2[fg];"
-              "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-              "drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='" + title + "':fontsize=54:"
-              "fontcolor=white:borderw=2:bordercolor=black:x=(w-text_w)/2:y=80,"
-              "drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='" + cap + "':fontsize=34:"
+              "[bg][fg]overlay=(W-w)/2:(H-h)/2" + tdraw +
+              ",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='" + cap + "':fontsize=34:"
               "fontcolor=yellow:borderw=2:bordercolor=black:x=(w-text_w)/2:y=h-220")
         srtp = os.path.join(outdir, f".sub_{job_id}.ass")
         sub_vf = ""
@@ -1683,7 +1714,8 @@ def _run_render_job(job_id: str, req: RenderRequest):
             os.remove(progfile)
         except Exception:
             pass
-        pe = subprocess.Popen(["ffmpeg", "-y", "-progress", progfile, "-nostats", "-i", src,
+        pe = subprocess.Popen(["ffmpeg", "-y", "-progress", progfile, "-nostats",
+                               "-ss", str(round(s, 1)), "-i", src,
                                "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                                "-c:a", "aac", "-movflags", "+faststart",
                                "-t", str(round(e - s, 1)), outp],
@@ -1695,7 +1727,7 @@ def _run_render_job(job_id: str, req: RenderRequest):
                 m = re.findall(r"out_time_ms=(\d+)", txt)
                 if m:
                     frac = min(1.0, int(m[-1]) / total_us)
-                    _render_jobs[job_id] = {"pct": round(60 + 35 * frac, 1),
+                    _render_jobs[job_id] = {"pct": round(50 + 45 * frac, 1),
                                             "stage": "encode", "done": False}
             except Exception:
                 pass
@@ -1715,11 +1747,12 @@ def _run_render_job(job_id: str, req: RenderRequest):
             os.remove(srtp)
         except Exception:
             pass
-        try:
-            thumb = _make_thumb(outp, req.title)
-        except Exception as ex:
-            logger.warning(f"thumb failed: {ex}")
-            thumb = None
+        if thumb is None:
+            try:
+                thumb = _make_thumb(outp, req.title, round(e - s, 1))
+            except Exception as ex:
+                logger.warning(f"thumb fallback failed: {ex}")
+                thumb = None
         _render_jobs[job_id] = {"pct": 100, "stage": "done", "done": True,
                                 "file": fname, "thumb": thumb, "seconds": round(e - s, 1)}
     except Exception as ex:

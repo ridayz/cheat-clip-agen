@@ -1137,6 +1137,7 @@ Transcript:
       });
       if (!startRes.ok) throw new Error(await startRes.text());
       let file: string | null = null;
+      let thumbFile: string | null = null;
       const started = await startRes.json();
       if (started.file) {
         file = started.file;
@@ -1151,6 +1152,7 @@ Transcript:
           if (st.done) {
             if (st.error) throw new Error(st.error);
             file = st.file;
+            thumbFile = st.thumb || null;
             break;
           }
         }
@@ -1158,12 +1160,16 @@ Transcript:
       } else {
         throw new Error('bad render response');
       }
-      const a = document.createElement('a');
-      a.href = `/api/clip-file/${file}`;
-      a.download = file;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      const dl = (name: string) => {
+        const a = document.createElement('a');
+        a.href = `/api/clip-file/${name}`;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      };
+      dl(file);
+      if (thumbFile) dl(thumbFile);
       await navigator.clipboard.writeText(buildCaption(clip, platform, selTitle));
       const up = platform === 'yt'
         ? 'https://www.youtube.com/upload'
