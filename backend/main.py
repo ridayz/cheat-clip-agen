@@ -1512,6 +1512,48 @@ class RenderRequest(BaseModel):
     end_time: float = Field(..., description="Clip end in seconds")
     title: str = Field("", description="Bumper title burned on video")
     caption: str = Field("", description="Caption burned at bottom")
+    transcript: str = Field("", description="Clip transcript for burned subtitles")
+
+
+def _srt_time(t: float) -> str:
+    t = max(0.0, t)
+    h, r = divmod(int(t), 3600)
+    m, sec = divmod(r, 60)
+    ms = int(round((t - int(t)) * 1000))
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+
+def _write_ass(path: str, text: str, s: float, e: float) -> bool:
+    words = (text or "").split()
+    if not words:
+        return False
+    dur = max(1.0, e - s)
+    per_line, lines = 7, []
+    for i in range(0, len(words), per_line):
+        lines.append(" ".join(words[i:i + per_line]))
+    each = max(0.8, dur / len(lines))
+    head = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n"
+            "ScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, "
+            "PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, "
+            "StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            "Style: Default,Arial,64,&H00FFFFFF,&H000019FF,&H80000000,&H00000000,0,0,0,0,"
+            "100,100,0,0,1,3,0,2,40,40,280,1\n\n[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(head)
+        for i, ln in enumerate(lines):
+            t0, t1 = _ass_time(s + i * each), _ass_time(min(e, s + (i + 1) * each))
+            f.write(f"Dialogue: 0,{t0},{t1},Default,,0,0,0,,{ln}\n")
+    return True
+
+
+def _ass_time(t: float) -> str:
+    t = max(0.0, t)
+    h, r = divmod(int(t), 3600)
+    m, sec = divmod(r, 60)
+    cs = int(round((t - int(t)) * 100))
+    return f"{h}:{m:02d}:{sec:02d}.{cs:02d}"
 
 
 _render_jobs: dict = {}
@@ -1521,6 +1563,43 @@ def _safe_draw_text(s: str, limit: int) -> str:
     s = (s or "")[:limit]
     s = re.sub(r"[^A-Za-z0-9\s\-.,!?#]", "", s)
     return s.replace(":", " ").replace("'", "").strip() or "Clip"
+
+
+def _thumb_lines(title: str):
+    words = _safe_draw_text(title, 60).split()
+    lines, cur = [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 <= 16:
+            cur = (cur + " " + w).strip()
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+        if len(lines) == 2:
+            break
+    if cur and len(lines) < 3:
+        lines.append(cur)
+    return lines[:3]
+
+
+def _make_thumb(outp: str, title: str) -> str:
+    lines = _thumb_lines(title)
+    draw = ""
+    y = 700
+    for ln in lines:
+        draw += (f",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='{ln}':"
+                 f"fontsize=88:fontcolor=white:borderw=3:bordercolor=black:"
+                 f"x=(w-text_w)/2:y={y}")
+        y += 130
+    draw += (",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='SHORTS':"
+             "fontsize=54:fontcolor=yellow:borderw=2:bordercolor=black:x=(w-text_w)/2:y=1150")
+    thumb = outp[:-4] + "_thumb.jpg"
+    subprocess.run(["ffmpeg", "-y", "-ss", "1", "-i", outp, "-vframes", "1",
+                    "-vf", "scale=1080:1920,eq=brightness=-0.25" + draw,
+                    "-q:v", "3", thumb],
+                   check=True, timeout=120,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return os.path.basename(thumb)
 
 
 @app.post("/api/render-clip")
@@ -1585,11 +1664,20 @@ def _run_render_job(job_id: str, req: RenderRequest):
         src = os.path.join(outdir, cands[0])
         title = _safe_draw_text(req.title, 60)
         cap = _safe_draw_text(req.caption, 90)
-        vf = ("scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+        vf = ("[0:v]split[a][b];"
+              "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=40[bg];"
+              "[b]scale=1080:-2[fg];"
+              "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
               "drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='" + title + "':fontsize=54:"
               "fontcolor=white:borderw=2:bordercolor=black:x=(w-text_w)/2:y=80,"
               "drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='" + cap + "':fontsize=34:"
               "fontcolor=yellow:borderw=2:bordercolor=black:x=(w-text_w)/2:y=h-220")
+        srtp = os.path.join(outdir, f".sub_{job_id}.ass")
+        sub_vf = ""
+        if _write_ass(srtp, req.transcript, 0, e - s):
+            esc = srtp.replace("\\", "/").replace(":", "\\:")
+            sub_vf = ",subtitles='" + esc + "'"
+        vf = vf + sub_vf
         progfile = os.path.join(outdir, f".prog_{job_id}.txt")
         try:
             os.remove(progfile)
@@ -1623,21 +1711,81 @@ def _run_render_job(job_id: str, req: RenderRequest):
             os.remove(src)
         except Exception:
             pass
+        try:
+            os.remove(srtp)
+        except Exception:
+            pass
+        try:
+            thumb = _make_thumb(outp, req.title)
+        except Exception as ex:
+            logger.warning(f"thumb failed: {ex}")
+            thumb = None
         _render_jobs[job_id] = {"pct": 100, "stage": "done", "done": True,
-                                "file": fname, "seconds": round(e - s, 1)}
+                                "file": fname, "thumb": thumb, "seconds": round(e - s, 1)}
     except Exception as ex:
         fail(str(ex))
 
 
 @app.get("/api/clip-file/{name}")
 def clip_file(name: str):
-    if not re.fullmatch(r"[A-Za-z0-9_\-]+\.mp4", name):
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+\.(mp4|jpg)", name):
         raise HTTPException(400, "bad name")
     from fastapi.responses import FileResponse
     p = os.path.join(_base_dir, "clips", name)
     if not os.path.exists(p):
         raise HTTPException(404, "not found")
-    return FileResponse(p, media_type="video/mp4", filename=name)
+    mt = "video/mp4" if name.endswith(".mp4") else "image/jpeg"
+    return FileResponse(p, media_type=mt, filename=name)
+
+
+class SuggestRequest(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    title: str = ""
+    caption: str = ""
+
+
+@app.post("/api/suggest-titles")
+def suggest_titles(req: SuggestRequest):
+    """Generate 3 Shorts-grade title variants via the user's agent."""
+    import requests as _rq
+    base = (req.base_url or "").strip().rstrip("/")
+    model = (req.model or "agnes/agnes-3.0-flash").strip()
+    if not base or not req.api_key:
+        raise HTTPException(400, "agent base_url + api_key required")
+    prompt = (
+        "Buatkan 3 varian judul YouTube Shorts (Bahasa Indonesia dominan, boleh campur Inggris) "
+        "dari materi berikut. Syarat: maksimal 60 karakter per judul, curiosity gap kuat, "
+        "1-2 kata CAPS untuk penekanan, tanpa clickbait bohong, tanpa tanda kutip.\n"
+        f"Judul asli: {req.title}\nCaption: {req.caption}\n"
+        'Balas HANYA JSON: {"titles": ["...", "...", "..."]}'
+    )
+    try:
+        r = _rq.post(base + "/chat/completions",
+                     headers={"Content-Type": "application/json",
+                              "Authorization": "Bearer " + req.api_key},
+                     json={"model": model,
+                           "messages": [{"role": "user", "content": prompt}],
+                           "temperature": 0.7, "max_tokens": 300},
+                     timeout=180)
+        r.raise_for_status()
+        raw = r.text.replace("data: [DONE]", "").strip()
+        try:
+            text = json.loads(raw)["choices"][0]["message"]["content"].strip()
+        except Exception:
+            dec = json.JSONDecoder()
+            obj, _ = dec.raw_decode(raw[raw.find("{"):])
+            text = obj["choices"][0]["message"]["content"].strip()
+        text = re.sub(r"^```(?:json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+        data = json.loads(text)
+        titles = [str(t)[:70] for t in data.get("titles", [])][:3]
+        if not titles:
+            raise ValueError("empty titles")
+        return {"titles": titles}
+    except Exception as e:
+        raise HTTPException(400, f"suggest failed: {str(e)[:200]}")
 
 
 @app.get("/api/models")

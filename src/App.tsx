@@ -20,7 +20,10 @@ export default function App() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [pubBusy, setPubBusy] = useState<Record<number, boolean>>({});
   const [pubMenu, setPubMenu] = useState<number | null>(null);
-  const [pubProg, setPubProg] = useState<Record<number, { pct: number; stage: string }>>({});
+  const [pubProg, setPubProg] = useState<Record<number, { pct: number; stage: string; thumb?: string }>>({});
+  const [pubTitles, setPubTitles] = useState<Record<number, string[]>>({});
+  const [pubTitleSel, setPubTitleSel] = useState<Record<number, number>>({});
+  const [pubTitlesBusy, setPubTitlesBusy] = useState<Record<number, boolean>>({});
   const [agentUrl, setAgentUrl] = useState(() => localStorage.getItem('cheat_clip_agent_url') || 'http://127.0.0.1:20128/v1');
 
   // AI model selection and custom focus prompt states
@@ -1075,17 +1078,48 @@ Transcript:
 
   // Publish: render vertical mp4 + copy platform caption + open upload page.
   // Upload button stays manual — everything is prepared up to that point.
-  const buildCaption = (clip: ViralClip, platform: 'yt' | 'tt' | 'fb') => {
+  const buildCaption = (clip: ViralClip, platform: 'yt' | 'tt' | 'fb', title?: string) => {
     const tags = (clip.hashtag_suggestion || '').trim();
     const cap = (clip.caption_suggestion || '').trim();
-    if (platform === 'yt') return `${clip.title}\n\n${cap}\n${tags} #Shorts`.trim();
+    const t = title || clip.title;
+    if (platform === 'yt') return `${t}\n\n${cap}\n${tags} #Shorts`.trim();
     if (platform === 'tt') return `${cap} ${tags}`.trim().slice(0, 400);
     return `${cap}\n${tags}`.trim();
+  };
+
+  const loadTitles = async (clip: ViralClip, index: number) => {
+    if (pubTitles[index]?.length) return;
+    setPubTitlesBusy((p) => ({ ...p, [index]: true }));
+    try {
+      const res = await fetch('/api/suggest-titles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          base_url: agentUrl.trim().replace(/\/$/, ''),
+          api_key: apiKey.trim(),
+          model: selectedModel,
+          title: clip.title,
+          caption: clip.caption_suggestion || '',
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      if (data.titles?.length) {
+        setPubTitles((p) => ({ ...p, [index]: data.titles }));
+        setPubTitleSel((p) => ({ ...p, [index]: 0 }));
+      }
+    } catch {
+      setPubTitles((p) => ({ ...p, [index]: [clip.title] }));
+      setPubTitleSel((p) => ({ ...p, [index]: 0 }));
+    } finally {
+      setPubTitlesBusy((p) => ({ ...p, [index]: false }));
+    }
   };
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
   const publishClip = async (clip: ViralClip, index: number, platform: 'yt' | 'tt' | 'fb') => {
+    const selTitle = pubTitles[index]?.[pubTitleSel[index] ?? 0] || clip.title;
     setPubBusy((p) => ({ ...p, [index]: true }));
     setPubProg((p) => ({ ...p, [index]: { pct: 0, stage: 'download' } }));
     try {
@@ -1096,8 +1130,9 @@ Transcript:
           url,
           start_time: clip.start_time,
           end_time: clip.end_time,
-          title: clip.title,
+          title: selTitle,
           caption: clip.caption_suggestion || '',
+          transcript: (clip as unknown as { transcript?: string }).transcript || '',
         }),
       });
       if (!startRes.ok) throw new Error(await startRes.text());
@@ -1112,7 +1147,7 @@ Transcript:
           const pr = await fetch(`/api/render-progress/${started.job_id}`);
           if (!pr.ok) throw new Error('progress lost');
           const st = await pr.json();
-          setPubProg((p) => ({ ...p, [index]: { pct: st.pct || 0, stage: st.stage || '...' } }));
+          setPubProg((p) => ({ ...p, [index]: { pct: st.pct || 0, stage: st.stage || '...', thumb: st.thumb } }));
           if (st.done) {
             if (st.error) throw new Error(st.error);
             file = st.file;
@@ -1129,7 +1164,7 @@ Transcript:
       document.body.appendChild(a);
       a.click();
       a.remove();
-      await navigator.clipboard.writeText(buildCaption(clip, platform));
+      await navigator.clipboard.writeText(buildCaption(clip, platform, selTitle));
       const up = platform === 'yt'
         ? 'https://www.youtube.com/upload'
         : platform === 'tt' ? 'https://www.tiktok.com/upload' : 'https://www.facebook.com/reels/create';
@@ -3319,7 +3354,7 @@ Transcript:
                             type="button"
                             className="form-input"
                             style={{ padding: '0.45rem 0.85rem', fontSize: '0.8rem', width: 'auto', borderRadius: '8px', cursor: 'pointer', background: 'rgba(168,85,247,0.15)', borderColor: 'rgba(168,85,247,0.5)', whiteSpace: 'nowrap' }}
-                            onClick={(e) => { e.stopPropagation(); setPubMenu(pubMenu === index ? null : index); }}
+                            onClick={(e) => { e.stopPropagation(); const open = pubMenu === index ? null : index; setPubMenu(open); if (open !== null) loadTitles(clip, index); }}
                             title="Render video vertikal + siapkan caption + buka halaman upload"
                           >
                             📤 Publish
@@ -3340,6 +3375,17 @@ Transcript:
                           onClick={(e) => e.stopPropagation()}
                           style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap', marginTop: '0.6rem', padding: '0.6rem 0.75rem', borderRadius: '8px', background: 'rgba(168,85,247,0.08)', border: '1px solid rgba(168,85,247,0.3)' }}
                         >
+                          <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', fontWeight: 700 }}>✨ Pilih judul:</span>
+                            {pubTitlesBusy[index] && <span style={{ fontSize: '0.75rem', color: 'var(--primary)' }}>⌛ Bikin varian judul...</span>}
+                            {(pubTitles[index] || []).map((t, ti) => (
+                              <label key={ti} style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', fontSize: '0.8rem', cursor: 'pointer', color: (pubTitleSel[index] ?? 0) === ti ? '#fff' : 'var(--text-secondary)' }}>
+                                <input type="radio" name={`pub-title-${index}`} checked={(pubTitleSel[index] ?? 0) === ti}
+                                  onChange={() => setPubTitleSel((p) => ({ ...p, [index]: ti }))} />
+                                {t}
+                              </label>
+                            ))}
+                          </div>
                           <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Upload ke:</span>
                           <button type="button" className="form-input" disabled={!!pubBusy[index]}
                             style={{ padding: '0.4rem 0.8rem', fontSize: '0.78rem', width: 'auto', borderRadius: '8px', cursor: 'pointer' }}
@@ -3365,6 +3411,13 @@ Transcript:
                               <div style={{ height: '8px', borderRadius: '6px', background: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
                                 <div style={{ height: '100%', width: `${Math.round(pubProg[index]?.pct || 0)}%`, borderRadius: '6px', background: 'linear-gradient(90deg,#a855f7,#ec4899)', transition: 'width 0.6s ease' }} />
                               </div>
+                              {pubProg[index]?.stage === 'done' && pubProg[index]?.thumb && (
+                                <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center', marginTop: '0.5rem' }}>
+                                  <img src={`/api/clip-file/${pubProg[index].thumb}`} alt="thumbnail"
+                                    style={{ width: '72px', height: '128px', objectFit: 'cover', borderRadius: '8px', border: '1px solid rgba(168,85,247,0.4)' }} />
+                                  <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>🖼️ Thumbnail otomatis dari judul clip</span>
+                                </div>
+                              )}
                             </div>
                           )}
                         </div>
