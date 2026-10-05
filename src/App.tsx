@@ -16,8 +16,12 @@ export default function App() {
   const { t } = useLanguage();
   const [url, setUrl] = useState('');
   const [durationPref, setDurationPref] = useState<'15s' | '30s' | '60s'>('30s');
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('cheat_clip_gemini_api_key') || '');
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem('cheat_clip_agent_key') || '');
   const [showApiKey, setShowApiKey] = useState(false);
+  const [pubBusy, setPubBusy] = useState<Record<number, boolean>>({});
+  const [pubMenu, setPubMenu] = useState<number | null>(null);
+  const [pubProg, setPubProg] = useState<Record<number, { pct: number; stage: string }>>({});
+  const [agentUrl, setAgentUrl] = useState(() => localStorage.getItem('cheat_clip_agent_url') || 'http://127.0.0.1:20128/v1');
 
   // AI model selection and custom focus prompt states
   const [selectedModel, setSelectedModel] = useState<string>(() => {
@@ -229,10 +233,38 @@ export default function App() {
     };
   }, [result]);
 
-  // Fetch available AI models when API key is detected/entered
+  // Fetch available AI models: agent endpoint first, Gemini legacy as fallback
   useEffect(() => {
     const fetchModels = async () => {
       const cleanKey = apiKey.trim();
+      const cleanUrl = agentUrl.trim().replace(/\/$/, '');
+      if (cleanUrl && cleanKey && cleanKey.length >= 8 && cleanKey.toLowerCase() !== 'mock') {
+        setLoadingModels(true);
+        try {
+          const res = await fetch('/api/agent-models', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ base_url: cleanUrl, api_key: cleanKey }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data.models && data.models.length > 0) {
+              setAvailableModels(data.models);
+              if (!data.models.includes(selectedModel)) {
+                const fallback = data.models.find((m: string) => m.includes('flash')) || data.models.find((m: string) => m.includes('dominic')) || data.models[0];
+                setSelectedModel(fallback);
+                localStorage.setItem('cheat_clip_selected_model', fallback);
+              }
+              return;
+            }
+          }
+        } catch (err) {
+          console.error('Failed to detect agent models:', err);
+        } finally {
+          setLoadingModels(false);
+        }
+        return;
+      }
       if (!cleanKey || cleanKey.length < 20 || cleanKey.toLowerCase() === 'mock') {
         setAvailableModels([]);
         return;
@@ -267,7 +299,7 @@ export default function App() {
     }, 600);
 
     return () => clearTimeout(delayDebounce);
-  }, [apiKey]);
+  }, [apiKey, agentUrl]);
 
   // Sync marked clips with local storage based on active video ID
   useEffect(() => {
@@ -809,6 +841,8 @@ export default function App() {
 
     try {
       const cleanApiKey = apiKey.trim();
+      const cleanAgentUrl = agentUrl.trim().replace(/\/$/, '');
+      const agentReady = !!(cleanAgentUrl && cleanApiKey);
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: {
@@ -820,6 +854,7 @@ export default function App() {
           duration: durationPref,
           api_key: cleanApiKey || undefined,
           model: selectedModel,
+          ...(agentReady ? { oai_base_url: cleanAgentUrl, oai_api_key: cleanApiKey, oai_model: selectedModel } : {}),
           custom_prompt: customPrompt.trim() || undefined,
           range_start: rangeStartSecs,
           range_end: rangeEndSecs,
@@ -1036,6 +1071,78 @@ Transcript:
       setToastMessage(t.results.copiedTimestampToast(ts));
       setTimeout(() => setToastMessage(null), 3000);
     });
+  };
+
+  // Publish: render vertical mp4 + copy platform caption + open upload page.
+  // Upload button stays manual — everything is prepared up to that point.
+  const buildCaption = (clip: ViralClip, platform: 'yt' | 'tt' | 'fb') => {
+    const tags = (clip.hashtag_suggestion || '').trim();
+    const cap = (clip.caption_suggestion || '').trim();
+    if (platform === 'yt') return `${clip.title}\n\n${cap}\n${tags} #Shorts`.trim();
+    if (platform === 'tt') return `${cap} ${tags}`.trim().slice(0, 400);
+    return `${cap}\n${tags}`.trim();
+  };
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  const publishClip = async (clip: ViralClip, index: number, platform: 'yt' | 'tt' | 'fb') => {
+    setPubBusy((p) => ({ ...p, [index]: true }));
+    setPubProg((p) => ({ ...p, [index]: { pct: 0, stage: 'download' } }));
+    try {
+      const startRes = await fetch('/api/render-clip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url,
+          start_time: clip.start_time,
+          end_time: clip.end_time,
+          title: clip.title,
+          caption: clip.caption_suggestion || '',
+        }),
+      });
+      if (!startRes.ok) throw new Error(await startRes.text());
+      let file: string | null = null;
+      const started = await startRes.json();
+      if (started.file) {
+        file = started.file;
+        setPubProg((p) => ({ ...p, [index]: { pct: 100, stage: 'done' } }));
+      } else if (started.job_id) {
+        for (let i = 0; i < 300; i++) {
+          await sleep(2000);
+          const pr = await fetch(`/api/render-progress/${started.job_id}`);
+          if (!pr.ok) throw new Error('progress lost');
+          const st = await pr.json();
+          setPubProg((p) => ({ ...p, [index]: { pct: st.pct || 0, stage: st.stage || '...' } }));
+          if (st.done) {
+            if (st.error) throw new Error(st.error);
+            file = st.file;
+            break;
+          }
+        }
+        if (!file) throw new Error('render timeout');
+      } else {
+        throw new Error('bad render response');
+      }
+      const a = document.createElement('a');
+      a.href = `/api/clip-file/${file}`;
+      a.download = file;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      await navigator.clipboard.writeText(buildCaption(clip, platform));
+      const up = platform === 'yt'
+        ? 'https://www.youtube.com/upload'
+        : platform === 'tt' ? 'https://www.tiktok.com/upload' : 'https://www.facebook.com/reels/create';
+      window.open(up, '_blank');
+      setPubMenu(null);
+      setToastMessage('Video + caption siap — tinggal upload!');
+      setTimeout(() => setToastMessage(null), 4000);
+    } catch (err) {
+      setToastMessage('Publish gagal: ' + String(err).slice(0, 150));
+      setTimeout(() => setToastMessage(null), 4000);
+    } finally {
+      setPubBusy((p) => ({ ...p, [index]: false }));
+    }
   };
 
   const markedClipsCount = useMemo(() => {
@@ -1492,6 +1599,28 @@ Transcript:
                 🤖 {t.form.aiSettingsTitle}
               </h3>
               
+              {/* Agent endpoint — required */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
+                  <span>{t.form.agentUrlLabel}</span>
+                </label>
+                <input
+                  id="agent-url-input"
+                  type="text"
+                  className="form-input"
+                  placeholder={t.form.agentUrlPlaceholder}
+                  value={agentUrl}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setAgentUrl(val);
+                    localStorage.setItem('cheat_clip_agent_url', val);
+                    if (val.trim()) setError(null);
+                  }}
+                  disabled={loading}
+                  style={{ height: '42px' }}
+                />
+              </div>
+
               {/* API Key input — required */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                 <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
@@ -1501,7 +1630,7 @@ Transcript:
                   </span>
                   <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
                     <a
-                      href="https://aistudio.google.com/"
+                      href="http://127.0.0.1:20128"
                       target="_blank"
                       rel="noopener noreferrer"
                       style={{ color: 'var(--primary)', textDecoration: 'none', fontSize: '0.75rem', fontWeight: 600, transition: 'var(--transition-smooth)' }}
@@ -1527,7 +1656,7 @@ Transcript:
                   onChange={(e) => {
                     const val = e.target.value;
                     setApiKey(val);
-                    localStorage.setItem('cheat_clip_gemini_api_key', val);
+                    localStorage.setItem('cheat_clip_agent_key', val);
                     if (val.trim()) setError(null);
                   }}
                   disabled={loading}
@@ -3155,11 +3284,11 @@ Transcript:
                       )}
 
                       {/* Actions and expand button */}
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '0.5rem', borderTop: '1px solid rgba(255,255,255,0.03)', paddingTop: '0.75rem' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.6rem', marginTop: '0.5rem', borderTop: '1px solid rgba(255,255,255,0.03)', paddingTop: '0.75rem' }}>
                         <button
                           type="button"
                           className="glowing-btn"
-                          style={{ padding: '0.45rem 1rem', fontSize: '0.8rem', borderRadius: '8px', boxShadow: 'none' }}
+                          style={{ padding: '0.45rem 1rem', fontSize: '0.8rem', borderRadius: '8px', boxShadow: 'none', whiteSpace: 'nowrap' }}
                           onClick={(e) => {
                             e.stopPropagation();
                             playClip(clip);
@@ -3172,7 +3301,7 @@ Transcript:
                           <button
                             type="button"
                             className="form-input"
-                            style={{ padding: '0.45rem 0.85rem', fontSize: '0.8rem', width: 'auto', borderRadius: '8px', cursor: 'pointer', background: 'transparent' }}
+                            style={{ padding: '0.45rem 0.85rem', fontSize: '0.8rem', width: 'auto', borderRadius: '8px', cursor: 'pointer', background: 'transparent', whiteSpace: 'nowrap' }}
                             onClick={(e) => handleCopyTimestamp(clip, e)}
                             title={t.results.copyTimestampTooltip}
                           >
@@ -3181,18 +3310,65 @@ Transcript:
                           <button
                             type="button"
                             className="form-input"
-                            style={{ padding: '0.45rem 0.85rem', fontSize: '0.8rem', width: 'auto', borderRadius: '8px', cursor: 'pointer', background: 'transparent' }}
+                            style={{ padding: '0.45rem 0.85rem', fontSize: '0.8rem', width: 'auto', borderRadius: '8px', cursor: 'pointer', background: 'transparent', whiteSpace: 'nowrap' }}
                             onClick={(e) => handleCopyClip(clip, e)}
                           >
                             {t.results.copyDetails}
                           </button>
-                          <span
-                            style={{ display: 'flex', alignItems: 'center', fontSize: '0.75rem', color: 'var(--primary)', fontWeight: 'bold' }}
+                          <button
+                            type="button"
+                            className="form-input"
+                            style={{ padding: '0.45rem 0.85rem', fontSize: '0.8rem', width: 'auto', borderRadius: '8px', cursor: 'pointer', background: 'rgba(168,85,247,0.15)', borderColor: 'rgba(168,85,247,0.5)', whiteSpace: 'nowrap' }}
+                            onClick={(e) => { e.stopPropagation(); setPubMenu(pubMenu === index ? null : index); }}
+                            title="Render video vertikal + siapkan caption + buka halaman upload"
                           >
-                            {isExpanded ? t.results.hideTranscript : t.results.showTranscript}
-                          </span>
+                            📤 Publish
+                          </button>
                         </div>
+
+                        <span
+                          onClick={(e) => { e.stopPropagation(); setExpandedClipIndex(isExpanded ? null : index); }}
+                          style={{ display: 'flex', alignItems: 'center', fontSize: '0.75rem', color: 'var(--primary)', fontWeight: 'bold', whiteSpace: 'nowrap', cursor: 'pointer', marginLeft: 'auto' }}
+                        >
+                          {isExpanded ? t.results.hideTranscript : t.results.showTranscript}
+                        </span>
                       </div>
+
+                      {/* Publish menu: YT / TikTok / FB */}
+                      {pubMenu === index && (
+                        <div
+                          onClick={(e) => e.stopPropagation()}
+                          style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap', marginTop: '0.6rem', padding: '0.6rem 0.75rem', borderRadius: '8px', background: 'rgba(168,85,247,0.08)', border: '1px solid rgba(168,85,247,0.3)' }}
+                        >
+                          <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Upload ke:</span>
+                          <button type="button" className="form-input" disabled={!!pubBusy[index]}
+                            style={{ padding: '0.4rem 0.8rem', fontSize: '0.78rem', width: 'auto', borderRadius: '8px', cursor: 'pointer' }}
+                            onClick={() => publishClip(clip, index, 'yt')}>
+                            ▶️ YouTube Shorts
+                          </button>
+                          <button type="button" className="form-input" disabled={!!pubBusy[index]}
+                            style={{ padding: '0.4rem 0.8rem', fontSize: '0.78rem', width: 'auto', borderRadius: '8px', cursor: 'pointer' }}
+                            onClick={() => publishClip(clip, index, 'tt')}>
+                            🎵 TikTok
+                          </button>
+                          <button type="button" className="form-input" disabled={!!pubBusy[index]}
+                            style={{ padding: '0.4rem 0.8rem', fontSize: '0.78rem', width: 'auto', borderRadius: '8px', cursor: 'pointer' }}
+                            onClick={() => publishClip(clip, index, 'fb')}>
+                            📘 FB Reels
+                          </button>
+                          {pubBusy[index] && (
+                            <div style={{ width: '100%', marginTop: '0.4rem' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', color: 'var(--primary)', marginBottom: '0.25rem' }}>
+                                <span>{pubProg[index]?.stage === 'encode' ? '🎞️ Encoding video...' : pubProg[index]?.stage === 'done' ? '✅ Siap!' : '⬇️ Download segmen...'}</span>
+                                <span style={{ fontWeight: 800 }}>{Math.round(pubProg[index]?.pct || 0)}%</span>
+                              </div>
+                              <div style={{ height: '8px', borderRadius: '6px', background: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
+                                <div style={{ height: '100%', width: `${Math.round(pubProg[index]?.pct || 0)}%`, borderRadius: '6px', background: 'linear-gradient(90deg,#a855f7,#ec4899)', transition: 'width 0.6s ease' }} />
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
 
                       {/* Expandable transcript text block */}
                       {isExpanded && (

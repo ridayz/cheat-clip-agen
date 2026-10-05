@@ -200,6 +200,52 @@ class VideoAnalysis(BaseModel):
     summary: str = Field(description="1-2 sentence video summary, followed by 2-4 general hashtags (e.g. #podcast #marriage #success)")
     clips: List[ViralClipGemini] = Field(description="List of viral clip candidates, sorted by virality_score desc")
 
+
+# ----------------------------------------------------------------
+# Custom OpenAI-compatible LLM backend (9Router / UOI / Dominic).
+# When env OAI_BASE_URL is set, analysis uses it instead of Gemini.
+# ----------------------------------------------------------------
+
+def run_oai_analysis(base_url, prompt_text, api_key=None, model=None):
+    """Call OpenAI-compatible /chat/completions, validate vs VideoAnalysis. Returns dict or None."""
+    import requests as _rq
+    key = api_key or os.environ.get("OAI_API_KEY", "")
+    model = model or os.environ.get("OAI_MODEL", "agnes/agnes-3.0-flash")
+    try:
+        schema_hint = json.dumps(VideoAnalysis.model_json_schema(), indent=1)
+    except Exception:
+        schema_hint = '{"summary": "string", "clips": []}'
+    full = (prompt_text + "\n\nReturn ONLY a valid JSON object matching this JSON Schema "
+            "(no markdown fences, no commentary):\n" + schema_hint)
+    for attempt in range(2):
+        try:
+            r = _rq.post(base_url.rstrip("/") + "/chat/completions",
+                         headers={"Content-Type": "application/json",
+                                  "Authorization": "Bearer " + key},
+                         json={"model": model,
+                               "messages": [{"role": "user", "content": full}],
+                               "temperature": 0.2, "max_tokens": 8192},
+                         timeout=300)
+            r.raise_for_status()
+            raw = r.text.replace("data: [DONE]", "").strip()
+            try:
+                text = json.loads(raw)["choices"][0]["message"]["content"].strip()
+            except Exception:
+                dec = json.JSONDecoder()
+                obj, _ = dec.raw_decode(raw[raw.find("{"):])
+                text = obj["choices"][0]["message"]["content"].strip()
+            text = re.sub(r"^```(?:json)?", "", text).strip()
+            text = re.sub(r"```$", "", text).strip()
+            try:
+                return VideoAnalysis.model_validate(json.loads(text)).model_dump()
+            except Exception as ve:
+                full = ("Previous output failed validation: " + str(ve)[:300] +
+                        "\nFix it and return ONLY valid JSON.\nOriginal task:\n" + prompt_text +
+                        "\nSchema:\n" + schema_hint)
+        except Exception as e:
+            logger.warning(f"OAI backend attempt {attempt + 1} failed: {e}")
+    return None
+
 # ----------------------------------------------------------------
 # API Request/Response Schemas
 # ----------------------------------------------------------------
@@ -209,6 +255,9 @@ class AnalyzeRequest(BaseModel):
     duration: str = Field("30s", description="Target clip duration: '15s', '30s', or '60s'")
     api_key: Optional[str] = Field(None, description="Optional custom Gemini API key provided by the user")
     model: Optional[str] = Field("gemini-2.5-flash", description="Preferred Gemini model name")
+    oai_base_url: Optional[str] = Field(None, description="Optional OpenAI-compatible agent endpoint (e.g. 9Router http://127.0.0.1:20128/v1)")
+    oai_api_key: Optional[str] = Field(None, description="API key for the agent endpoint")
+    oai_model: Optional[str] = Field(None, description="Model id on the agent endpoint")
     custom_prompt: Optional[str] = Field(None, description="Optional custom focus prompt for clips search")
     range_start: Optional[float] = Field(None, description="Search range start in seconds")
     range_end: Optional[float] = Field(None, description="Search range end in seconds")
@@ -1435,6 +1484,162 @@ def get_flash_models_for_key(client: genai.Client) -> List[str]:
     return ordered
 
 
+@app.get("/api/agent-models")
+@app.post("/api/agent-models")
+def list_agent_models(base_url: str = Query(""), api_key: str = Query(""),
+                      payload: Optional[Dict[str, Any]] = Body(None)):
+    """Detect an OpenAI-compatible agent: return its /v1/models list. No key stored server-side."""
+    import requests as _rq
+    if payload:
+        base_url = payload.get("base_url", base_url)
+        api_key = payload.get("api_key", api_key)
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        return {"models": [], "error": "base_url required"}
+    try:
+        r = _rq.get(base + "/v1/models", headers={"Authorization": "Bearer " + (api_key or "")},
+                    timeout=120)
+        r.raise_for_status()
+        ids = [m.get("id") for m in r.json().get("data", []) if m.get("id")]
+        return {"models": ids, "count": len(ids)}
+    except Exception as e:
+        return {"models": [], "error": str(e)[:200]}
+
+
+class RenderRequest(BaseModel):
+    url: str = Field(..., description="YouTube video URL")
+    start_time: float = Field(..., description="Clip start in seconds")
+    end_time: float = Field(..., description="Clip end in seconds")
+    title: str = Field("", description="Bumper title burned on video")
+    caption: str = Field("", description="Caption burned at bottom")
+
+
+_render_jobs: dict = {}
+
+
+def _safe_draw_text(s: str, limit: int) -> str:
+    s = (s or "")[:limit]
+    s = re.sub(r"[^A-Za-z0-9\s\-.,!?#]", "", s)
+    return s.replace(":", " ").replace("'", "").strip() or "Clip"
+
+
+@app.post("/api/render-clip")
+def render_clip(req: RenderRequest):
+    """Start background render job. Returns {job_id} or {file} if cached."""
+    vid = extract_video_id(req.url) or "clip"
+    s = max(0.0, float(req.start_time))
+    e = max(float(req.end_time), s + 1.0)
+    fname = f"{vid}_{int(s)}-{int(e)}.mp4"
+    outp = os.path.join(_base_dir, "clips", fname)
+    if os.path.exists(outp):
+        return {"file": fname, "seconds": round(e - s, 1), "done": True}
+    job_id = os.urandom(6).hex()
+    _render_jobs[job_id] = {"pct": 0, "stage": "download", "done": False}
+    threading.Thread(target=_run_render_job, args=(job_id, req), daemon=True).start()
+    return {"job_id": job_id, "done": False}
+
+
+@app.get("/api/render-progress/{job_id}")
+def render_progress(job_id: str):
+    j = _render_jobs.get(job_id)
+    if not j:
+        raise HTTPException(404, "unknown job")
+    return j
+
+
+def _run_render_job(job_id: str, req: RenderRequest):
+    import uuid as _uuid
+    vid = extract_video_id(req.url) or "clip"
+    s = max(0.0, float(req.start_time))
+    e = max(float(req.end_time), s + 1.0)
+    outdir = os.path.join(_base_dir, "clips")
+    os.makedirs(outdir, exist_ok=True)
+    fname = f"{vid}_{int(s)}-{int(e)}.mp4"
+    outp = os.path.join(outdir, fname)
+    total_us = max(1.0, (e - s)) * 1000000.0
+
+    def fail(msg):
+        _render_jobs[job_id] = {"pct": 0, "stage": "error", "done": True, "error": msg[:300]}
+
+    try:
+        sec = f"*{int(s)}-{int(e) + 1}"
+        tmp = os.path.join(outdir, f"{vid}_src.%(ext)s")
+        _render_jobs[job_id] = {"pct": 1, "stage": "download", "done": False}
+        p = subprocess.Popen([sys.executable, "-m", "yt_dlp", "--newline", "--progress",
+                              "--download-sections", sec, "--force-keyframes-at-cuts",
+                              "-f", "bv*[height<=720]+ba/b[height<=720]/b",
+                              "-o", tmp, req.url],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, bufsize=1)
+        for line in p.stdout:
+            m = re.search(r"\[download\]\s+(\d+(?:\.\d+)?)%", line)
+            if m:
+                _render_jobs[job_id] = {"pct": round(min(99.0, float(m.group(1))) * 0.6, 1),
+                                        "stage": "download", "done": False}
+        p.wait(timeout=600)
+        if p.returncode != 0:
+            return fail("download failed")
+        cands = [f for f in os.listdir(outdir) if f.startswith(vid + "_src.")]
+        if not cands:
+            return fail("download produced no file")
+        src = os.path.join(outdir, cands[0])
+        title = _safe_draw_text(req.title, 60)
+        cap = _safe_draw_text(req.caption, 90)
+        vf = ("scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+              "drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='" + title + "':fontsize=54:"
+              "fontcolor=white:borderw=2:bordercolor=black:x=(w-text_w)/2:y=80,"
+              "drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='" + cap + "':fontsize=34:"
+              "fontcolor=yellow:borderw=2:bordercolor=black:x=(w-text_w)/2:y=h-220")
+        progfile = os.path.join(outdir, f".prog_{job_id}.txt")
+        try:
+            os.remove(progfile)
+        except Exception:
+            pass
+        pe = subprocess.Popen(["ffmpeg", "-y", "-progress", progfile, "-nostats", "-i", src,
+                               "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                               "-c:a", "aac", "-movflags", "+faststart",
+                               "-t", str(round(e - s, 1)), outp],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        while pe.poll() is None:
+            try:
+                with open(progfile, errors="ignore") as f:
+                    txt = f.read()
+                m = re.findall(r"out_time_ms=(\d+)", txt)
+                if m:
+                    frac = min(1.0, int(m[-1]) / total_us)
+                    _render_jobs[job_id] = {"pct": round(60 + 35 * frac, 1),
+                                            "stage": "encode", "done": False}
+            except Exception:
+                pass
+            import time as _t
+            _t.sleep(0.5)
+        try:
+            os.remove(progfile)
+        except Exception:
+            pass
+        if pe.returncode != 0 or not os.path.exists(outp):
+            return fail("encode failed")
+        try:
+            os.remove(src)
+        except Exception:
+            pass
+        _render_jobs[job_id] = {"pct": 100, "stage": "done", "done": True,
+                                "file": fname, "seconds": round(e - s, 1)}
+    except Exception as ex:
+        fail(str(ex))
+
+
+@app.get("/api/clip-file/{name}")
+def clip_file(name: str):
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+\.mp4", name):
+        raise HTTPException(400, "bad name")
+    from fastapi.responses import FileResponse
+    p = os.path.join(_base_dir, "clips", name)
+    if not os.path.exists(p):
+        raise HTTPException(404, "not found")
+    return FileResponse(p, media_type="video/mp4", filename=name)
+
+
 @app.get("/api/models")
 @app.post("/api/models")
 def list_available_models(
@@ -1527,8 +1732,11 @@ async def analyze_video(
             is_mock = gemini_key.lower() == "mock"
 
             if not gemini_key:
-                yield _sse({"error": "Gemini API Key is required. Enter it in the web interface.", "status": 400})
-                return
+                oai_cfg = ((request.oai_base_url or "") if request else "") or os.environ.get("OAI_BASE_URL", "")
+                if not (oai_cfg or "").strip():
+                    yield _sse({"error": "Gemini API Key is required. Enter it in the web interface.", "status": 400})
+                    return
+                gemini_key = "oai-backend"
 
             # ── Step 1: Extract video ID & metadata ─────────────────────────────
             video_id = extract_video_id(request.url)
@@ -1915,258 +2123,281 @@ async def analyze_video(
                 "message": f"Assembling prompt and engagement context for {requested_model}..."
             })
 
-            # ── Step 4: Gemini API call with dynamic Flash fallback models and retry ───────────
-            client = genai.Client(api_key=gemini_key)
-        
-            # Discover all available Flash models for the user's API key
-            discovered_flash = await asyncio.to_thread(get_flash_models_for_key, client)
-        
-            # Build models_to_try:
-            # 1. Start with the requested model
-            # 2. Append all discovered and known flash models in version descending order (e.g. 3.7, 3.6, 3.5, 2.5, 2.0, 1.5)
-            #    so all available flash models are tried before giving up
-            models_to_try = [requested_model]
-            for fm in discovered_flash:
-                if fm not in models_to_try:
-                    models_to_try.append(fm)
-            for km in KNOWN_FLASH_MODELS:
-                if km not in models_to_try:
-                    models_to_try.append(km)
-
-            logger.info(f"Flash fallback chain prepared: {models_to_try}")
-
-            response = None
-            last_error = None
-            encountered_quota_error = None
-            analysis_data = None
-            successful_model = None
-
-            for idx, model_name in enumerate(models_to_try):
-                next_model_hint = models_to_try[idx + 1] if idx + 1 < len(models_to_try) else None
-
-                MAX_RETRIES = 2
-            
-                for attempt in range(MAX_RETRIES):
-                    if attempt > 0:
-                        wait = 2
-                        yield _sse({
-                            "step": 4,
-                            "step_progress": 25,
-                            "overall_progress": 75,
-                            "stage": "Transient Retry",
-                            "detail": f"{model_name} busy — waiting {wait}s before retry ({attempt + 1}/{MAX_RETRIES})...",
-                            "model": model_name,
-                            "message": f"{model_name} is busy — waiting {wait}s before retry {attempt + 1}/{MAX_RETRIES}..."
-                        })
-                        await asyncio.sleep(wait)
-                
+            oai_base = ((request.oai_base_url or "") if request else "") or os.environ.get("OAI_BASE_URL", "")
+            oai_base = oai_base.strip().rstrip("/")
+            if oai_base:
+                oai_model = ((request.oai_model or "") if request else "") or os.environ.get("OAI_MODEL", "agnes/agnes-3.0-flash")
+                oai_key = ((request.oai_api_key or "") if request else "") or None
+                yield _sse({
+                    "step": 4, "step_progress": 15, "overall_progress": 73,
+                    "stage": "Custom LLM Backend",
+                    "detail": f"Using custom backend {oai_model}, skipping Gemini...",
+                    "model": oai_model,
+                    "message": f"Analyzing with {oai_model} via custom backend..."
+                })
+                analysis_data = await asyncio.to_thread(run_oai_analysis, oai_base, prompt, oai_key, oai_model)
+                successful_model = oai_model if analysis_data else None
+                response = True if analysis_data else None
+                if analysis_data is None:
                     yield _sse({
-                        "step": 4,
-                        "step_progress": 18,
-                        "overall_progress": 74,
-                        "stage": "Neural Model Dispatch",
-                        "detail": f"Dispatched {len(transcript_dump)} lines to {model_name} (attempt {attempt + 1})...",
-                        "model": model_name,
-                        "message": f"Calling {model_name} (attempt {attempt + 1}/{MAX_RETRIES})..."
-                    })
-                
-                    # Execute Gemini call with heartbeat to keep mobile connection alive and show live stages
-                    task = asyncio.create_task(asyncio.to_thread(
-                        client.models.generate_content,
-                        model=model_name,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=VideoAnalysis,
-                            temperature=0.2,
-                        )
-                    ))
-                
-                    call_start = asyncio.get_event_loop().time()
-                    while not task.done():
-                        done, _ = await asyncio.wait([task], timeout=2.0)
-                        if not done:
-                            elapsed = int(asyncio.get_event_loop().time() - call_start)
-                        
-                            if elapsed < 8:
-                                stage = "Neural Context Loading"
-                                detail = f"Transmitting {len(transcript_dump)} timestamped dialogue segments to {model_name}..."
-                                step_prog = min(35, 12 + elapsed * 3)
-                            elif elapsed < 20:
-                                stage = "Retention Spike Cross-Analysis"
-                                detail = f"Correlating viewer retention peaks against speaker dialogue to isolate viral moments..."
-                                step_prog = min(55, 35 + int((elapsed - 8) * 1.6))
-                            elif elapsed < 40:
-                                stage = "Viral Hook & Curiosity Detection"
-                                detail = f"Scanning transcript dialogue for opening hooks, punchlines, controversial takes & emotional peaks..."
-                                step_prog = min(72, 55 + int((elapsed - 20) * 0.85))
-                            elif elapsed < 65:
-                                stage = "Coherence & Sentence Boundary Snapping"
-                                detail = f"Ensuring clip candidates start and end naturally on sentence boundaries without mid-word cuts..."
-                                step_prog = min(85, 72 + int((elapsed - 40) * 0.52))
-                            elif elapsed < 80:
-                                stage = "Virality Scoring & Selection"
-                                detail = f"Calculating virality coefficients (1-100) and selecting the top {clip_range} highest potential clips..."
-                                step_prog = min(92, 85 + int((elapsed - 65) * 0.46))
-                            else:
-                                stage = "Social Media Metadata Synthesis"
-                                detail = f"Drafting attention-grabbing titles, social captions, and targeted hashtags ({elapsed}s)..."
-                                step_prog = min(96, 92 + min(4, int((elapsed - 80) * 0.4)))
-
-                            overall_prog = 70 + int(step_prog * 0.28)
-                            yield _sse({
-                                "step": 4,
-                                "keepalive": True,
-                                "step_progress": step_prog,
-                                "overall_progress": overall_prog,
-                                "stage": stage,
-                                "detail": detail,
-                                "model": model_name,
-                                "elapsed": elapsed,
-                                "message": f"[{model_name} | {elapsed}s] {stage}: {detail}"
-                            })
-
-                            if elapsed > 90:
-                                task.cancel()
-                                logger.warning(f"Model {model_name} execution timed out (>90s). Advancing to fallback model...")
-                                last_error = f"{model_name} execution timed out (>90s)"
-                                break
-                
-                    if task.cancelled():
-                        continue
-
-                    try:
-                        resp_candidate = await task
-                        last_error = None
-                    
-                        # Parse structured response
-                        parsed_data = None
-                        if hasattr(resp_candidate, 'parsed') and resp_candidate.parsed is not None:
-                            parsed = resp_candidate.parsed
-                            parsed_data = {
-                                "summary": getattr(parsed, 'summary', ''),
-                                "clips": [
-                                    {
-                                        "title": getattr(c, 'title', ''),
-                                        "start_time": getattr(c, 'start_time', 0.0),
-                                        "end_time": getattr(c, 'end_time', 0.0),
-                                        "hook_time": getattr(c, 'hook_time', None),
-                                        "virality_score": getattr(c, 'virality_score', 0),
-                                        "key_quotes": getattr(c, 'key_quotes', []),
-                                        "title_suggestion": getattr(c, 'title_suggestion', ''),
-                                        "caption_suggestion": getattr(c, 'caption_suggestion', ''),
-                                        "hashtag_suggestion": getattr(c, 'hashtag_suggestion', ''),
-                                    }
-                                    for c in (getattr(parsed, 'clips', []) or [])
-                                ]
-                            }
-                        elif resp_candidate.text:
-                            raw_text = resp_candidate.text.strip()
-                            if raw_text.startswith("```"):
-                                raw_text = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text)
-                                raw_text = re.sub(r"\n?```$", "", raw_text)
-                            try:
-                                parsed_data = json.loads(raw_text)
-                            except Exception as json_err:
-                                logger.warning(f"JSON parsing error from {model_name}: {json_err}")
-                                parsed_data = None
-
-                        if parsed_data is not None:
-                            clips_found = len(parsed_data.get('clips', []))
-                            if clips_found == 0 and next_model_hint is not None:
-                                logger.warning(f"{model_name} returned 0 clips. Will try next flash model {next_model_hint}...")
-                                yield _sse({
-                                    "step": 4,
-                                    "step_progress": 40,
-                                    "overall_progress": 78,
-                                    "stage": "Flash Model Fallback",
-                                    "detail": f"{model_name} returned 0 clips — switching to {next_model_hint} for deeper extraction...",
-                                    "model": next_model_hint,
-                                    "message": f"{model_name} returned 0 clips — switching to {next_model_hint}..."
-                                })
-                                last_error = Exception(f"{model_name} returned 0 clips")
-                                break
-                        
-                            response = resp_candidate
-                            analysis_data = parsed_data
-                            successful_model = model_name
-                            break
-                        else:
-                            last_error = Exception(f"{model_name} returned empty or unparseable response")
-                            break
-                        
-                    except Exception as e:
-                        last_error = e
-                        err_str = str(e).lower()
-                        logger.warning(f"Error from {model_name} (attempt {attempt + 1}): {e}")
-                    
-                        if any(x in err_str for x in ('429', 'quota', 'resource exhausted', 'rate limit')):
-                            encountered_quota_error = e
-                            break
-
-                        if any(x in err_str for x in ('404', 'not found', 'not supported')):
-                            break
-                    
-                        is_server_busy = any(x in err_str for x in ('503', 'unavailable', 'overloaded', '500', 'internal'))
-                        if not is_server_busy:
-                            break
-            
-                if analysis_data is not None and response is not None:
-                    break
-                
-                if next_model_hint is not None:
-                    err_summary = "quota reached" if any(x in str(last_error).lower() for x in ('429', 'quota', 'rate limit')) else \
-                                  "not available or deprecated" if "404" in str(last_error) else \
-                                  "temporarily busy"
-                    yield _sse({
-                        "step": 4,
-                        "step_progress": 35,
-                        "overall_progress": 76,
-                        "stage": "Flash Fallback",
-                        "detail": f"{model_name} {err_summary} — switching to fallback {next_model_hint}...",
-                        "model": next_model_hint,
-                        "message": f"{model_name} {err_summary} — switching to flash fallback model {next_model_hint}..."
-                    })
-
-            if analysis_data is None:
-                # If any model in the fallback chain suffered quota exhaustion, prioritize showing the quota explanation
-                error_to_report = encountered_quota_error or last_error
-                if error_to_report is not None:
-                    err_str = str(error_to_report).lower()
-                    if any(x in err_str for x in ('429', 'quota', 'resource exhausted', 'rate limit')):
-                        yield _sse({
-                            "error": "Quota limit reached across all available Gemini Flash models for this API key. Free keys have a request limit per minute. Please change your API key, generate a fresh free key at aistudio.google.com, or wait 30–60 seconds before trying again.",
-                            "status": 429
-                        })
-                    elif any(x in err_str for x in ('503', 'unavailable', 'overloaded')):
-                        yield _sse({
-                            "error": "Google Gemini servers are currently experiencing high demand across all Flash models. Please change to a different Gemini API key or wait a few moments and try again.",
-                            "status": 503
-                        })
-                    elif any(x in err_str for x in ('401', '403', 'api_key', 'invalid', 'permission')):
-                        yield _sse({
-                            "error": "Invalid or restricted Gemini API key. Please change your API key or generate a new free key at aistudio.google.com.",
-                            "status": 401
-                        })
-                    elif any(x in err_str for x in ('404', 'not found', 'not supported')):
-                        models_preview = ', '.join(models_to_try[:3])
-                        yield _sse({
-                            "error": f"All tested Gemini Flash models ({models_preview}...) were unavailable or not supported for this API key. Please change your Gemini API key or generate a new one at aistudio.google.com.",
-                            "status": 404
-                        })
-                    else:
-                        clean_err = sanitize_sensitive_data(str(error_to_report))
-                        logger.error(f"Gemini error after all fallback models: {clean_err}")
-                        yield _sse({
-                            "error": f"AI analysis failed across all available Flash models ({clean_err}). Please change your Gemini API key or try again in a few moments.",
-                            "status": 500
-                        })
-                else:
-                    yield _sse({
-                        "error": "No response received after trying all available Gemini Flash models. Please change your Gemini API key or try again in a few moments.",
+                        "error": "Custom LLM backend failed. Check OAI_BASE_URL/OAI_API_KEY in backend/.env.",
                         "status": 500
                     })
-                return
+                    return
+            else:
+
+                # ── Step 4: Gemini API call with dynamic Flash fallback models and retry ───────────
+                client = genai.Client(api_key=gemini_key)
+        
+                # Discover all available Flash models for the user's API key
+                discovered_flash = await asyncio.to_thread(get_flash_models_for_key, client)
+        
+                # Build models_to_try:
+                # 1. Start with the requested model
+                # 2. Append all discovered and known flash models in version descending order (e.g. 3.7, 3.6, 3.5, 2.5, 2.0, 1.5)
+                #    so all available flash models are tried before giving up
+                models_to_try = [requested_model]
+                for fm in discovered_flash:
+                    if fm not in models_to_try:
+                        models_to_try.append(fm)
+                for km in KNOWN_FLASH_MODELS:
+                    if km not in models_to_try:
+                        models_to_try.append(km)
+
+                logger.info(f"Flash fallback chain prepared: {models_to_try}")
+
+                response = None
+                last_error = None
+                encountered_quota_error = None
+                analysis_data = None
+                successful_model = None
+
+                for idx, model_name in enumerate(models_to_try):
+                    next_model_hint = models_to_try[idx + 1] if idx + 1 < len(models_to_try) else None
+
+                    MAX_RETRIES = 2
+            
+                    for attempt in range(MAX_RETRIES):
+                        if attempt > 0:
+                            wait = 2
+                            yield _sse({
+                                "step": 4,
+                                "step_progress": 25,
+                                "overall_progress": 75,
+                                "stage": "Transient Retry",
+                                "detail": f"{model_name} busy — waiting {wait}s before retry ({attempt + 1}/{MAX_RETRIES})...",
+                                "model": model_name,
+                                "message": f"{model_name} is busy — waiting {wait}s before retry {attempt + 1}/{MAX_RETRIES}..."
+                            })
+                            await asyncio.sleep(wait)
+                
+                        yield _sse({
+                            "step": 4,
+                            "step_progress": 18,
+                            "overall_progress": 74,
+                            "stage": "Neural Model Dispatch",
+                            "detail": f"Dispatched {len(transcript_dump)} lines to {model_name} (attempt {attempt + 1})...",
+                            "model": model_name,
+                            "message": f"Calling {model_name} (attempt {attempt + 1}/{MAX_RETRIES})..."
+                        })
+                
+                        # Execute Gemini call with heartbeat to keep mobile connection alive and show live stages
+                        task = asyncio.create_task(asyncio.to_thread(
+                            client.models.generate_content,
+                            model=model_name,
+                            contents=prompt,
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                response_schema=VideoAnalysis,
+                                temperature=0.2,
+                            )
+                        ))
+                
+                        call_start = asyncio.get_event_loop().time()
+                        while not task.done():
+                            done, _ = await asyncio.wait([task], timeout=2.0)
+                            if not done:
+                                elapsed = int(asyncio.get_event_loop().time() - call_start)
+                        
+                                if elapsed < 8:
+                                    stage = "Neural Context Loading"
+                                    detail = f"Transmitting {len(transcript_dump)} timestamped dialogue segments to {model_name}..."
+                                    step_prog = min(35, 12 + elapsed * 3)
+                                elif elapsed < 20:
+                                    stage = "Retention Spike Cross-Analysis"
+                                    detail = f"Correlating viewer retention peaks against speaker dialogue to isolate viral moments..."
+                                    step_prog = min(55, 35 + int((elapsed - 8) * 1.6))
+                                elif elapsed < 40:
+                                    stage = "Viral Hook & Curiosity Detection"
+                                    detail = f"Scanning transcript dialogue for opening hooks, punchlines, controversial takes & emotional peaks..."
+                                    step_prog = min(72, 55 + int((elapsed - 20) * 0.85))
+                                elif elapsed < 65:
+                                    stage = "Coherence & Sentence Boundary Snapping"
+                                    detail = f"Ensuring clip candidates start and end naturally on sentence boundaries without mid-word cuts..."
+                                    step_prog = min(85, 72 + int((elapsed - 40) * 0.52))
+                                elif elapsed < 80:
+                                    stage = "Virality Scoring & Selection"
+                                    detail = f"Calculating virality coefficients (1-100) and selecting the top {clip_range} highest potential clips..."
+                                    step_prog = min(92, 85 + int((elapsed - 65) * 0.46))
+                                else:
+                                    stage = "Social Media Metadata Synthesis"
+                                    detail = f"Drafting attention-grabbing titles, social captions, and targeted hashtags ({elapsed}s)..."
+                                    step_prog = min(96, 92 + min(4, int((elapsed - 80) * 0.4)))
+
+                                overall_prog = 70 + int(step_prog * 0.28)
+                                yield _sse({
+                                    "step": 4,
+                                    "keepalive": True,
+                                    "step_progress": step_prog,
+                                    "overall_progress": overall_prog,
+                                    "stage": stage,
+                                    "detail": detail,
+                                    "model": model_name,
+                                    "elapsed": elapsed,
+                                    "message": f"[{model_name} | {elapsed}s] {stage}: {detail}"
+                                })
+
+                                if elapsed > 90:
+                                    task.cancel()
+                                    logger.warning(f"Model {model_name} execution timed out (>90s). Advancing to fallback model...")
+                                    last_error = f"{model_name} execution timed out (>90s)"
+                                    break
+                
+                        if task.cancelled():
+                            continue
+
+                        try:
+                            resp_candidate = await task
+                            last_error = None
+                    
+                            # Parse structured response
+                            parsed_data = None
+                            if hasattr(resp_candidate, 'parsed') and resp_candidate.parsed is not None:
+                                parsed = resp_candidate.parsed
+                                parsed_data = {
+                                    "summary": getattr(parsed, 'summary', ''),
+                                    "clips": [
+                                        {
+                                            "title": getattr(c, 'title', ''),
+                                            "start_time": getattr(c, 'start_time', 0.0),
+                                            "end_time": getattr(c, 'end_time', 0.0),
+                                            "hook_time": getattr(c, 'hook_time', None),
+                                            "virality_score": getattr(c, 'virality_score', 0),
+                                            "key_quotes": getattr(c, 'key_quotes', []),
+                                            "title_suggestion": getattr(c, 'title_suggestion', ''),
+                                            "caption_suggestion": getattr(c, 'caption_suggestion', ''),
+                                            "hashtag_suggestion": getattr(c, 'hashtag_suggestion', ''),
+                                        }
+                                        for c in (getattr(parsed, 'clips', []) or [])
+                                    ]
+                                }
+                            elif resp_candidate.text:
+                                raw_text = resp_candidate.text.strip()
+                                if raw_text.startswith("```"):
+                                    raw_text = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text)
+                                    raw_text = re.sub(r"\n?```$", "", raw_text)
+                                try:
+                                    parsed_data = json.loads(raw_text)
+                                except Exception as json_err:
+                                    logger.warning(f"JSON parsing error from {model_name}: {json_err}")
+                                    parsed_data = None
+
+                            if parsed_data is not None:
+                                clips_found = len(parsed_data.get('clips', []))
+                                if clips_found == 0 and next_model_hint is not None:
+                                    logger.warning(f"{model_name} returned 0 clips. Will try next flash model {next_model_hint}...")
+                                    yield _sse({
+                                        "step": 4,
+                                        "step_progress": 40,
+                                        "overall_progress": 78,
+                                        "stage": "Flash Model Fallback",
+                                        "detail": f"{model_name} returned 0 clips — switching to {next_model_hint} for deeper extraction...",
+                                        "model": next_model_hint,
+                                        "message": f"{model_name} returned 0 clips — switching to {next_model_hint}..."
+                                    })
+                                    last_error = Exception(f"{model_name} returned 0 clips")
+                                    break
+                        
+                                response = resp_candidate
+                                analysis_data = parsed_data
+                                successful_model = model_name
+                                break
+                            else:
+                                last_error = Exception(f"{model_name} returned empty or unparseable response")
+                                break
+                        
+                        except Exception as e:
+                            last_error = e
+                            err_str = str(e).lower()
+                            logger.warning(f"Error from {model_name} (attempt {attempt + 1}): {e}")
+                    
+                            if any(x in err_str for x in ('429', 'quota', 'resource exhausted', 'rate limit')):
+                                encountered_quota_error = e
+                                break
+
+                            if any(x in err_str for x in ('404', 'not found', 'not supported')):
+                                break
+                    
+                            is_server_busy = any(x in err_str for x in ('503', 'unavailable', 'overloaded', '500', 'internal'))
+                            if not is_server_busy:
+                                break
+            
+                    if analysis_data is not None and response is not None:
+                        break
+                
+                    if next_model_hint is not None:
+                        err_summary = "quota reached" if any(x in str(last_error).lower() for x in ('429', 'quota', 'rate limit')) else \
+                                      "not available or deprecated" if "404" in str(last_error) else \
+                                      "temporarily busy"
+                        yield _sse({
+                            "step": 4,
+                            "step_progress": 35,
+                            "overall_progress": 76,
+                            "stage": "Flash Fallback",
+                            "detail": f"{model_name} {err_summary} — switching to fallback {next_model_hint}...",
+                            "model": next_model_hint,
+                            "message": f"{model_name} {err_summary} — switching to flash fallback model {next_model_hint}..."
+                        })
+
+                if analysis_data is None:
+                    # If any model in the fallback chain suffered quota exhaustion, prioritize showing the quota explanation
+                    error_to_report = encountered_quota_error or last_error
+                    if error_to_report is not None:
+                        err_str = str(error_to_report).lower()
+                        if any(x in err_str for x in ('429', 'quota', 'resource exhausted', 'rate limit')):
+                            yield _sse({
+                                "error": "Quota limit reached across all available Gemini Flash models for this API key. Free keys have a request limit per minute. Please change your API key, generate a fresh free key at aistudio.google.com, or wait 30–60 seconds before trying again.",
+                                "status": 429
+                            })
+                        elif any(x in err_str for x in ('503', 'unavailable', 'overloaded')):
+                            yield _sse({
+                                "error": "Google Gemini servers are currently experiencing high demand across all Flash models. Please change to a different Gemini API key or wait a few moments and try again.",
+                                "status": 503
+                            })
+                        elif any(x in err_str for x in ('401', '403', 'api_key', 'invalid', 'permission')):
+                            yield _sse({
+                                "error": "Invalid or restricted Gemini API key. Please change your API key or generate a new free key at aistudio.google.com.",
+                                "status": 401
+                            })
+                        elif any(x in err_str for x in ('404', 'not found', 'not supported')):
+                            models_preview = ', '.join(models_to_try[:3])
+                            yield _sse({
+                                "error": f"All tested Gemini Flash models ({models_preview}...) were unavailable or not supported for this API key. Please change your Gemini API key or generate a new one at aistudio.google.com.",
+                                "status": 404
+                            })
+                        else:
+                            clean_err = sanitize_sensitive_data(str(error_to_report))
+                            logger.error(f"Gemini error after all fallback models: {clean_err}")
+                            yield _sse({
+                                "error": f"AI analysis failed across all available Flash models ({clean_err}). Please change your Gemini API key or try again in a few moments.",
+                                "status": 500
+                            })
+                    else:
+                        yield _sse({
+                            "error": "No response received after trying all available Gemini Flash models. Please change your Gemini API key or try again in a few moments.",
+                            "status": 500
+                        })
+                    return
 
             # Fallback clip synthesis if 0 clips were returned after all models
             if len(analysis_data.get('clips', [])) == 0 and enriched_transcript:
