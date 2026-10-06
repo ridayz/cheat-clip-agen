@@ -1523,6 +1523,56 @@ def _srt_time(t: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
 
 
+_whisper_model = None
+
+
+def _transcribe_words(wav_path: str):
+    """Real word timings via faster-whisper (numpy path, bypasses av). Returns [(start, end, word)] or []."""
+    global _whisper_model
+    try:
+        import wave
+        import numpy as _np
+        from faster_whisper import WhisperModel
+        if _whisper_model is None:
+            _whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+        with wave.open(wav_path, "rb") as w:
+            raw = w.readframes(w.getnframes())
+            audio = _np.frombuffer(raw, dtype=_np.int16).astype(_np.float32) / 32768.0
+        segments, _ = _whisper_model.transcribe(audio, word_timestamps=True)
+        words = []
+        for seg in segments:
+            for w in (seg.words or []):
+                if w.word.strip():
+                    words.append((float(w.start), float(w.end), w.word.strip()))
+        return words
+    except Exception as e:
+        logger.warning(f"whisper failed: {e}")
+        return []
+
+
+def _write_ass_words(path: str, words, s: float, e: float) -> bool:
+    if not words:
+        return False
+    per_line, lines = 7, []
+    for i in range(0, len(words), per_line):
+        chunk = words[i:i + per_line]
+        lines.append((chunk[0][0] + s, chunk[-1][1] + s,
+                      " ".join(w[2] for w in chunk)))
+    head = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n"
+            "ScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, "
+            "PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, "
+            "StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            "Style: Default,Arial,64,&H00FFFFFF,&H000019FF,&H80000000,&H00000000,0,0,0,0,"
+            "100,100,0,0,1,3,0,2,40,40,280,1\n\n[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(head)
+        for t0, t1, ln in lines:
+            f.write(f"Dialogue: 0,{_ass_time(t0)},{_ass_time(min(t1, e))},Default,,0,0,0,,{ln}\n")
+    return True
+
+
 def _write_ass(path: str, text: str, s: float, e: float) -> bool:
     words = (text or "").split()
     if not words:
@@ -1705,7 +1755,24 @@ def _run_render_job(job_id: str, req: RenderRequest):
               "fontcolor=yellow:borderw=2:bordercolor=black:x=(w-text_w)/2:y=h-220")
         srtp = os.path.join(outdir, f".sub_{job_id}.ass")
         sub_vf = ""
-        if _write_ass(srtp, req.transcript, 0, e - s):
+        _render_jobs[job_id] = {"pct": 58, "stage": "subtitle", "done": False}
+        words = []
+        try:
+            wavp = os.path.join(outdir, f".au_{job_id}.wav")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", str(round(s, 1)),
+                            "-t", str(round(e - s, 1)), "-i", src,
+                            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavp],
+                           check=True, timeout=300,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            words = _transcribe_words(wavp)
+            try:
+                os.remove(wavp)
+            except Exception:
+                pass
+        except Exception as ex:
+            logger.warning(f"audio extract failed: {ex}")
+        wrote = _write_ass_words(srtp, words, 0, e - s) if words else _write_ass(srtp, req.transcript, 0, e - s)
+        if wrote:
             esc = srtp.replace("\\", "/").replace(":", "\\:")
             sub_vf = ",subtitles='" + esc + "'"
         vf = vf + sub_vf

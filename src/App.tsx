@@ -24,6 +24,60 @@ export default function App() {
   const [pubTitles, setPubTitles] = useState<Record<number, string[]>>({});
   const [pubTitleSel, setPubTitleSel] = useState<Record<number, number>>({});
   const [pubTitlesBusy, setPubTitlesBusy] = useState<Record<number, boolean>>({});
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchProg, setBatchProg] = useState({ done: 0, total: 0 });
+
+  const renderMarked = async () => {
+    const list = (result?.clips || []).filter((c) => !!markedClips[`${c.start_time}_${c.end_time}`]);
+    if (!list.length || batchBusy) return;
+    setBatchBusy(true);
+    setBatchProg({ done: 0, total: list.length });
+    let okCount = 0;
+    for (const clip of list) {
+      try {
+        const r = await fetch('/api/render-clip', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url,
+            start_time: clip.start_time,
+            end_time: clip.end_time,
+            title: clip.title,
+            caption: clip.caption_suggestion || '',
+            transcript: (clip as unknown as { transcript?: string }).transcript || '',
+          }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        const st = await r.json();
+        let file: string | null = st.file || null;
+        if (!file && st.job_id) {
+          for (let i = 0; i < 300; i++) {
+            await sleep(2000);
+            const pr = await (await fetch(`/api/render-progress/${st.job_id}`)).json();
+            if (pr.done) {
+              if (!pr.error) file = pr.file;
+              break;
+            }
+          }
+        }
+        if (file) {
+          okCount++;
+          const a = document.createElement('a');
+          a.href = `/api/clip-file/${file}`;
+          a.download = file;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+        }
+      } catch {
+        /* lanjut clip berikutnya */
+      }
+      setBatchProg((p) => ({ ...p, done: p.done + 1 }));
+    }
+    setBatchBusy(false);
+    setToastMessage(`Batch selesai: ${okCount}/${list.length} video jadi + ke-download.`);
+    setTimeout(() => setToastMessage(null), 5000);
+  };
   const [agentUrl, setAgentUrl] = useState(() => localStorage.getItem('cheat_clip_agent_url') || 'http://127.0.0.1:20128/v1');
 
   // AI model selection and custom focus prompt states
@@ -2836,6 +2890,28 @@ Transcript:
                     {t.results.generatedClipsOverview(result.clips.length)}
                   </h3>
                   <div style={{ position: 'relative', display: 'inline-block' }}>
+                    <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                    <button
+                      type="button"
+                      onClick={() => renderMarked()}
+                      disabled={batchBusy || markedClipsCount === 0}
+                      title="Render semua clip yang ditandai, berurutan otomatis"
+                      style={{
+                        fontSize: '0.72rem',
+                        padding: '0.2rem 0.55rem',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.25rem',
+                        borderRadius: '6px',
+                        background: 'rgba(168,85,247,0.12)',
+                        border: '1px solid rgba(168,85,247,0.4)',
+                        color: '#d8b4fe',
+                        cursor: batchBusy || markedClipsCount === 0 ? 'not-allowed' : 'pointer',
+                        fontWeight: 600,
+                      }}
+                    >
+                      {batchBusy ? `⏳ ${batchProg.done}/${batchProg.total}` : `🎬 Render marked (${markedClipsCount})`}
+                    </button>
                     <button
                       type="button"
                       onClick={(e) => toggleTimestampMenu('overview', e)}
@@ -2876,6 +2952,7 @@ Transcript:
                       <span>▾</span>
                     </button>
                     {copyTimestampMenuTarget === 'overview' && renderTimestampFormatMenu('right')}
+                  </div>
                   </div>
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', maxHeight: '250px', overflowY: 'auto', paddingRight: '0.5rem' }}>
