@@ -20,7 +20,8 @@ export default function App() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [pubBusy, setPubBusy] = useState<Record<number, boolean>>({});
   const [pubMenu, setPubMenu] = useState<number | null>(null);
-  const [pubProg, setPubProg] = useState<Record<number, { pct: number; stage: string; thumb?: string }>>({});
+  const [pubProg, setPubProg] = useState<Record<number, { pct: number; stage: string; thumb?: string; thumbs?: string[] }>>({});
+  const [pubThumbSel, setPubThumbSel] = useState<Record<number, number>>({});
   const [pubTitles, setPubTitles] = useState<Record<number, string[]>>({});
   const [pubTitleSel, setPubTitleSel] = useState<Record<number, number>>({});
   const [pubTitlesBusy, setPubTitlesBusy] = useState<Record<number, boolean>>({});
@@ -1191,7 +1192,6 @@ Transcript:
       });
       if (!startRes.ok) throw new Error(await startRes.text());
       let file: string | null = null;
-      let thumbFile: string | null = null;
       const started = await startRes.json();
       if (started.file) {
         file = started.file;
@@ -1202,11 +1202,10 @@ Transcript:
           const pr = await fetch(`/api/render-progress/${started.job_id}`);
           if (!pr.ok) throw new Error('progress lost');
           const st = await pr.json();
-          setPubProg((p) => ({ ...p, [index]: { pct: st.pct || 0, stage: st.stage || '...', thumb: st.thumb } }));
+          setPubProg((p) => ({ ...p, [index]: { pct: st.pct || 0, stage: st.stage || '...', thumb: st.thumb, thumbs: st.thumbs } }));
           if (st.done) {
             if (st.error) throw new Error(st.error);
             file = st.file;
-            thumbFile = st.thumb || null;
             break;
           }
         }
@@ -1223,7 +1222,6 @@ Transcript:
         a.remove();
       };
       dl(file);
-      if (thumbFile) dl(thumbFile);
       await navigator.clipboard.writeText(buildCaption(clip, platform, selTitle));
       const up = platform === 'yt'
         ? 'https://www.youtube.com/upload'
@@ -3494,11 +3492,28 @@ Transcript:
                               <div style={{ height: '8px', borderRadius: '6px', background: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
                                 <div style={{ height: '100%', width: `${Math.round(pubProg[index]?.pct || 0)}%`, borderRadius: '6px', background: 'linear-gradient(90deg,#a855f7,#ec4899)', transition: 'width 0.6s ease' }} />
                               </div>
-                              {pubProg[index]?.stage === 'done' && pubProg[index]?.thumb && (
-                                <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center', marginTop: '0.5rem' }}>
-                                  <img src={`/api/clip-file/${pubProg[index].thumb}`} alt="thumbnail"
-                                    style={{ width: '72px', height: '128px', objectFit: 'cover', borderRadius: '8px', border: '1px solid rgba(168,85,247,0.4)' }} />
-                                  <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>🖼️ Thumbnail otomatis dari judul clip</span>
+                              {(pubProg[index]?.thumbs?.length ? pubProg[index].thumbs! : (pubProg[index]?.thumb ? [pubProg[index].thumb!] : [])).length > 0 && (
+                                <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'flex-start', marginTop: '0.5rem', flexWrap: 'wrap' }}>
+                                  {(pubProg[index]?.thumbs?.length ? pubProg[index].thumbs! : [pubProg[index].thumb!]).map((th, ti) => {
+                                    const sel = (pubThumbSel[index] ?? 0) === ti;
+                                    return (
+                                      <div key={th} onClick={() => {
+                                        setPubThumbSel((p) => ({ ...p, [index]: ti }));
+                                        const a = document.createElement('a');
+                                        a.href = `/api/clip-file/${th}`;
+                                        a.download = th;
+                                        document.body.appendChild(a);
+                                        a.click();
+                                        a.remove();
+                                      }} style={{ cursor: 'pointer', textAlign: 'center' }}>
+                                        <img src={`/api/clip-file/${th}`} alt={`thumb-${ti}`}
+                                          style={{ width: '72px', height: '128px', objectFit: 'cover', borderRadius: '8px', border: sel ? '2px solid #ec4899' : '1px solid rgba(168,85,247,0.4)' }} />
+                                        <div style={{ fontSize: '0.65rem', color: sel ? '#ec4899' : 'var(--text-secondary)', fontWeight: sel ? 800 : 400 }}>
+                                          {th.includes('_bold_') ? '🎮 Bold' : th.includes('_clean_') ? '✨ Clean' : th.includes('_shock_') ? '😱 Shock' : `Varian ${ti + 1}`}
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
                                 </div>
                               )}
                             </div>

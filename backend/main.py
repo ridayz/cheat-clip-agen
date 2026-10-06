@@ -1513,6 +1513,7 @@ class RenderRequest(BaseModel):
     title: str = Field("", description="Bumper title burned on video")
     caption: str = Field("", description="Caption burned at bottom")
     transcript: str = Field("", description="Clip transcript for burned subtitles")
+    thumb_preset: str = Field("bold", description="Thumbnail preset: bold|clean|shock")
 
 
 def _srt_time(t: float) -> str:
@@ -1637,12 +1638,10 @@ def _make_thumb(outp: str, title: str, dur: float = 10.0) -> str:
     draw = ""
     y = 300
     for ln in lines:
-        draw += (f",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='{ln}':"
+        draw += (f",drawtext=fontfile='C\\:/Windows/Fonts/ariblk.ttf':text='{ln}':"
                  f"fontsize=96:fontcolor=white:borderw=3:bordercolor=black:"
                  f"x=(w-text_w)/2:y={y}")
         y += 140
-    draw += (",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='SHORTS':"
-             "fontsize=60:fontcolor=yellow:borderw=2:bordercolor=black:x=(w-text_w)/2:y=" + str(y + 30))
     thumb = outp[:-4] + "_thumb.jpg"
     at = max(0.5, dur * 0.35)
     subprocess.run(["ffmpeg", "-y", "-ss", str(round(at, 1)), "-i", outp, "-vframes", "1",
@@ -1721,29 +1720,61 @@ def _run_render_job(job_id: str, req: RenderRequest):
             _ty += 70
         cap = _safe_draw_text(req.caption, 90)
         thumb = None
+        thumbs = []
         try:
-            lines = _thumb_lines(req.title)
-            tdraw = ""
-            _y = 300
-            for _ln in lines:
-                tdraw += (f",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='{_ln}':"
-                          f"fontsize=96:fontcolor=white:borderw=3:bordercolor=black:"
-                          f"x=(w-text_w)/2:y={_y}")
-                _y += 140
-            tdraw += (",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='SHORTS':"
-                      "fontsize=60:fontcolor=yellow:borderw=2:bordercolor=black:"
-                      f"x=(w-text_w)/2:y={_y + 30}")
-            thumb = fname[:-4] + "_thumb.jpg"
-            subprocess.run(["ffmpeg", "-y", "-ss", str(round(s + max(0.5, (e - s) * 0.35), 1)),
-                            "-i", src, "-vframes", "1",
-                            "-vf", ("[0:v]split[a][b];"
-                                     "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
-                                     "crop=1080:1920,gblur=sigma=40[bg];"
-                                     "[b]scale=1080:-2[fg];"
-                                     "[bg][fg]overlay=(W-w)/2:(H-h)/2" + tdraw),
-                            "-q:v", "3", os.path.join(outdir, thumb)],
-                           check=True, timeout=120,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            tat = str(round(s + max(0.5, (e - s) * 0.35), 1))
+            tlines = _thumb_lines(req.title)
+            styles = {
+                "bold": {"lines": tlines[:3], "fs": 96, "cols": ["white", "yellow", "red"],
+                         "tag": True, "base": "fit"},
+                "clean": {"lines": None,
+                          "fs": 72, "cols": ["white"], "tag": False, "base": "fitblur"},
+                "shock": {"lines": tlines[:2], "fs": 120, "cols": ["white", "yellow"],
+                          "tag": False, "base": "punch"},
+            }
+            for pname, st in styles.items():
+                if st["lines"] is None:
+                    words, cl, cur = _safe_draw_text(req.title, 60).split(), [], ""
+                    for w in words:
+                        if len(cur) + len(w) + 1 <= 20:
+                            cur = (cur + " " + w).strip()
+                        else:
+                            if cur:
+                                cl.append(cur)
+                            cur = w
+                            if len(cl) == 1:
+                                break
+                    if cur and len(cl) < 2:
+                        cl.append(cur)
+                    st["lines"] = cl[:2] or ["Clip"]
+                draw, _yy = "", {"bold": 300, "clean": 800, "shock": 420}.get(pname, 300)
+                for i, _ln in enumerate(st["lines"]):
+                    draw += (f",drawtext=fontfile='C\\:/Windows/Fonts/ariblk.ttf':text='{_ln}':"
+                             f"fontsize={st['fs']}:fontcolor={st['cols'][i % len(st['cols'])]}:"
+                             f"borderw=3:bordercolor=black:x=(w-text_w)/2:y={_yy}")
+                    _yy += st["fs"] + 44
+                if st["base"] == "punch":
+                    core = "crop=iw*0.75:ih*0.75,scale=1080:1920,eq=saturation=1.5"
+                elif st["base"] == "fitblur":
+                    core = ("[0:v]split[a][b];"
+                            "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
+                            "crop=1080:1920,gblur=sigma=60[bg];"
+                            "[b]scale=1080:-2[fg];"
+                            "[bg][fg]overlay=(W-w)/2:(H-h)/2")
+                else:
+                    core = ("[0:v]split[a][b];"
+                            "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
+                            "crop=1080:1920,gblur=sigma=40[bg];"
+                            "[b]scale=1080:-2[fg];"
+                            "[bg][fg]overlay=(W-w)/2:(H-h)/2")
+                tname = fname[:-4] + f"_{pname}_thumb.jpg"
+                subprocess.run(["ffmpeg", "-y", "-ss", tat, "-i", src, "-vframes", "1",
+                                "-vf", core + draw,
+                                "-q:v", "3", os.path.join(outdir, tname)],
+                               check=True, timeout=120,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                thumbs.append(tname)
+            thumb = next((t for t in thumbs if "_bold_" in t), thumbs[0] if thumbs else None)
         except Exception as ex:
             logger.warning(f"thumb failed: {ex}")
             thumb = None
@@ -1821,7 +1852,7 @@ def _run_render_job(job_id: str, req: RenderRequest):
                 logger.warning(f"thumb fallback failed: {ex}")
                 thumb = None
         _render_jobs[job_id] = {"pct": 100, "stage": "done", "done": True,
-                                "file": fname, "thumb": thumb, "seconds": round(e - s, 1)}
+                                "file": fname, "thumb": thumb, "thumbs": thumbs, "seconds": round(e - s, 1)}
     except Exception as ex:
         fail(str(ex))
 
